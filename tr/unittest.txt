@@ -2,21 +2,21 @@ import unittest
 from unittest.mock import MagicMock, patch
 import json
 
-# adls_connector.py
+# Assuming your original source code file is named adls_connector.py
 from adls_connector import ADLSConnector
 
 
 class TestADLSConnector(unittest.TestCase):
 
     def setUp(self):
-        # 在每个测试开始前，清除单例状态，确保测试隔离性
+        # Reset the singleton instance before each test to ensure test isolation
         ADLSConnector._instance = None
 
-        # 准备常见的环境变量和参数模拟
+        # Prepare mock objects for SparkSession and file path
         self.mock_spark = MagicMock()
         self.file_path = "abfss://mycontainer@myaccount.dfs.core.windows.net/mydir"
 
-        # 模拟环境变量
+        # Mock environment variables required by the connector
         self.env_patcher = patch.dict('os.environ', {
             'CATALOG_URL': 'http://mock-catalog',
             'ACCOUNT': 'myaccount',
@@ -27,32 +27,33 @@ class TestADLSConnector(unittest.TestCase):
         self.env_patcher.start()
 
     def tearDown(self):
+        # Clean up the environment patcher and reset the singleton status
         self.env_patcher.stop()
         ADLSConnector._instance = None
 
     @patch('adls_connector.ADLSConnector._authenticate')
     def test_singleton_pattern(self, mock_auth):
-        """测试单例模式是否生效"""
+        """Verify that the singleton pattern works correctly."""
         mock_auth.return_value = MagicMock()
 
         instance1 = ADLSConnector(self.mock_spark, self.file_path)
         instance2 = ADLSConnector(self.mock_spark, self.file_path)
 
-        # 两个实例应当指向同一个内存地址
+        # Both instances must point to the exact same memory address
         self.assertIs(instance1, instance2)
-        # _authenticate 应该只被调用了一次
+        # The _authenticate method should only be invoked once during the first initialization
         mock_auth.assert_called_once()
 
     @patch('adls_connector.urllib.request.urlopen')
     @patch('adls_connector.urllib.request.Request')
     def test_post_json(self, mock_request, mock_urlopen):
-        """测试 post_json 方法能够正确发送并解析 JSON"""
-        # 模拟网络返回的 JSON 数据
+        """Verify that post_json accurately sends payloads and parses JSON responses."""
+        # Mock the network stream returning a JSON byte string
         mock_response = MagicMock()
         mock_response.read.return_value = b'{"status": "success"}'
         mock_urlopen.return_value = mock_response
 
-        # 实例化（这里需要Mock掉 _authenticate 以免其在 __init__ 中报错）
+        # Instantiate the connector while mocking out _authenticate to prevent execution errors in __init__
         with patch.object(ADLSConnector, '_authenticate', return_value=MagicMock()):
             connector = ADLSConnector(self.mock_spark, self.file_path)
 
@@ -62,17 +63,17 @@ class TestADLSConnector(unittest.TestCase):
 
             result = connector.post_json(url, payload, token)
 
-            # 断言返回结果解析正确
+            # Assert that the parsed dictionary matches the expected value
             self.assertEqual(result, {"status": "success"})
-            # 校验 Request 对象是否构建
+            # Validate that the urllib Request object was correctly initialized
             mock_request.assert_called_once()
 
     def test_find_sas_recursive(self):
-        """测试 _find_sas 递归查找目标 token 的能力"""
+        """Test the recursive behavior of _find_sas when traversing complex structures."""
         with patch.object(ADLSConnector, '_authenticate', return_value=MagicMock()):
             connector = ADLSConnector(self.mock_spark, self.file_path)
 
-            # 嵌套的数据结构，SAS Token 在最里层
+            # Deeply nested data structure containing the target SAS Token at the leaf node
             nested_obj = {
                 "level1": [
                     {"not_me": "random"},
@@ -85,13 +86,13 @@ class TestADLSConnector(unittest.TestCase):
 
     @patch('adls_connector.DataLakeServiceClient')
     def test_authenticate_success(self, mock_service_client):
-        """测试授权成功并能正确返回 FileSystemClient"""
+        """Verify successful token acquisition and correct FileSystemClient routing."""
         mock_fs_client = MagicMock()
         mock_svc_instance = MagicMock()
         mock_svc_instance.get_file_system_client.return_value = mock_fs_client
         mock_service_client.return_value = mock_svc_instance
 
-        # 模拟 post_json 返回有效的凭证信息
+        # Mock post_json returning valid credential payloads
         mock_credentials = {
             'credentials': {
                 'adls.sas-token.myaccount': 'mock_sas_token_value',
@@ -102,7 +103,7 @@ class TestADLSConnector(unittest.TestCase):
         with patch.object(ADLSConnector, 'post_json', return_value=mock_credentials):
             connector = ADLSConnector(self.mock_spark, self.file_path)
 
-            # 验证返回的 fs 是否为我们 mock 的对象
+            # Ensure the assigned file system client matches our mocked instance
             self.assertEqual(connector.fs, mock_fs_client)
             mock_service_client.assert_called_once_with(
                 'https://myaccount.dfs.core.windows.net',
@@ -111,7 +112,7 @@ class TestADLSConnector(unittest.TestCase):
             )
 
     def test_parse_adls_path_valid(self):
-        """测试 _parse_adls_path 在合法的路径下能正确拆分"""
+        """Verify that _parse_adls_path correctly splits structured abfss:// paths."""
         with patch.object(ADLSConnector, '_authenticate', return_value=MagicMock()):
             connector = ADLSConnector(self.mock_spark, self.file_path)
 
@@ -123,7 +124,7 @@ class TestADLSConnector(unittest.TestCase):
             self.assertEqual(key, "folder/file.txt")
 
     def test_parse_adls_path_invalid(self):
-        """测试 _parse_adls_path 面对非法路径时抛出 ValueError"""
+        """Verify that _parse_adls_path raises a ValueError when dealing with malformed paths."""
         with patch.object(ADLSConnector, '_authenticate', return_value=MagicMock()):
             connector = ADLSConnector(self.mock_spark, self.file_path)
 
@@ -132,12 +133,12 @@ class TestADLSConnector(unittest.TestCase):
                 connector._parse_adls_path(invalid_path)
 
     def test_load_script(self):
-        """测试 load_script 能正确读取并转码文件内容"""
+        """Verify that load_script downloads and successfully decodes remote script content."""
         mock_fs = MagicMock()
         mock_file_client = MagicMock()
         mock_download = MagicMock()
 
-        # 模拟从 Azure 下载回来的二进制文本
+        # Mock the stream response representing remote data payload
         mock_download.readall.return_value = b"print('hello')"
         mock_file_client.download_file.return_value = mock_download
         mock_fs.get_file_client.return_value = mock_file_client
@@ -151,7 +152,7 @@ class TestADLSConnector(unittest.TestCase):
 
     @patch('builtins.open', new_callable=unittest.mock.mock_open)
     def test_download_file(self, mock_file_open):
-        """测试 download_file 能正确下载并将内容写入本地"""
+        """Verify that download_file writes downloaded bytes to the local file system."""
         mock_fs = MagicMock()
         mock_file_client = MagicMock()
         mock_download = MagicMock()
@@ -167,7 +168,7 @@ class TestADLSConnector(unittest.TestCase):
             result = connector.download_file("abfss://c@a.dfs.core.windows.net/file.txt", local_path)
 
             self.assertEqual(result, local_path)
-            # 验证是否正确打开了本地文件并写入
+            # Ensure local safe I/O context opens the correct path with binary write permissions
             mock_file_open.assert_called_once_with(local_path, "wb")
             mock_file_open().write.assert_called_once_with(b"binary_data")
 
