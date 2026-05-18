@@ -45,92 +45,97 @@ class TestADLSConnector(unittest.TestCase):
 
     @patch('adls_connector.urllib.request.urlopen')
     @patch('adls_connector.urllib.request.Request')
-    def test_post_json(self, mock_request, mock_urlopen):
+    @patch('adls_connector.ADLSConnector._authenticate')
+    def test_post_json(self, mock_auth, mock_request, mock_urlopen):
         """Verify that post_json accurately sends payloads and parses JSON responses."""
+        mock_auth.return_value = MagicMock()
+
         # Mock the network stream returning a JSON byte string
         mock_response = MagicMock()
         mock_response.read.return_value = b'{"status": "success"}'
         mock_urlopen.return_value = mock_response
 
-        # Instantiate the connector while mocking out _authenticate to prevent execution errors in __init__
-        with patch.object(ADLSConnector, '_authenticate', return_value=MagicMock()):
-            connector = ADLSConnector(self.mock_spark, self.file_path)
+        connector = ADLSConnector(self.mock_spark, self.file_path)
 
-            url = "http://test-url"
-            payload = {"key": "value"}
-            token = "test_token"
+        url = "http://test-url"
+        payload = {"key": "value"}
+        token = "test_token"
 
-            result = connector.post_json(url, payload, token)
+        result = connector.post_json(url, payload, token)
 
-            # Assert that the parsed dictionary matches the expected value
-            self.assertEqual(result, {"status": "success"})
-            # Validate that the urllib Request object was correctly initialized
-            mock_request.assert_called_once()
+        # Assert that the parsed dictionary matches the expected value
+        self.assertEqual(result, {"status": "success"})
+        # Validate that the urllib Request object was correctly initialized
+        mock_request.assert_called_once()
 
-    def test_find_sas_recursive(self):
+    @patch('adls_connector.ADLSConnector._authenticate')
+    def test_find_sas_recursive(self, mock_auth):
         """Test the recursive behavior of _find_sas when traversing complex structures."""
-        with patch.object(ADLSConnector, '_authenticate', return_value=MagicMock()):
-            connector = ADLSConnector(self.mock_spark, self.file_path)
+        mock_auth.return_value = MagicMock()
 
-            # Deeply nested data structure containing the target SAS Token at the leaf node
-            nested_obj = {
-                "level1": [
-                    {"not_me": "random"},
-                    {"target": "something?sv=2021&sig=abcdefg"}
-                ]
-            }
+        connector = ADLSConnector(self.mock_spark, self.file_path)
 
-            sas = connector._find_sas(nested_obj)
-            self.assertEqual(sas, "sv=2021&sig=abcdefg")
+        # Deeply nested data structure containing the target SAS Token at the leaf node
+        nested_obj = {
+            "level1": [
+                {"not_me": "random"},
+                {"target": "something?sv=2021&sig=abcdefg"}
+            ]
+        }
+
+        sas = connector._find_sas(nested_obj)
+        self.assertEqual(sas, "sv=2021&sig=abcdefg")
 
     @patch('adls_connector.DataLakeServiceClient')
-    def test_authenticate_success(self, mock_service_client):
+    @patch('adls_connector.ADLSConnector.post_json')
+    def test_authenticate_success(self, mock_post_json, mock_service_client):
         """Verify successful token acquisition and correct FileSystemClient routing."""
         mock_fs_client = MagicMock()
         mock_svc_instance = MagicMock()
         mock_svc_instance.get_file_system_client.return_value = mock_fs_client
         mock_service_client.return_value = mock_svc_instance
 
-        # Mock post_json returning valid credential payloads
-        mock_credentials = {
+        # Mock post_json returning valid credential payloads prior to object creation
+        mock_post_json.return_value = {
             'credentials': {
                 'adls.sas-token.myaccount': 'mock_sas_token_value',
                 'adls.sas-token.expires-at-ms.myaccount': '1700000000000'
             }
         }
 
-        # Patch post_json on the class level before instantiation to ensure _authenticate targets it correctly
-        with patch.object(ADLSConnector, 'post_json', return_value=mock_credentials):
-            connector = ADLSConnector(self.mock_spark, self.file_path)
+        # Instantiation will trigger _authenticate, which internally runs our mocked post_json safely
+        connector = ADLSConnector(self.mock_spark, self.file_path)
 
-            # Ensure the assigned file system client matches our mocked instance
-            self.assertEqual(connector.fs, mock_fs_client)
-            mock_service_client.assert_called_once_with(
-                'https://myaccount.dfs.core.windows.net',
-                credential='mock_sas_token_value',
-                connection_verify=False
-            )
+        # Ensure the assigned file system client matches our mocked instance
+        self.assertEqual(connector.fs, mock_fs_client)
+        mock_service_client.assert_called_once_with(
+            'https://myaccount.dfs.core.windows.net',
+            credential='mock_sas_token_value',
+            connection_verify=False
+        )
 
-    def test_parse_adls_path_valid(self):
+    @patch('adls_connector.ADLSConnector._authenticate')
+    def test_parse_adls_path_valid(self, mock_auth):
         """Verify that _parse_adls_path correctly splits structured abfss:// paths."""
-        with patch.object(ADLSConnector, '_authenticate', return_value=MagicMock()):
-            connector = ADLSConnector(self.mock_spark, self.file_path)
+        mock_auth.return_value = MagicMock()
+        connector = ADLSConnector(self.mock_spark, self.file_path)
 
-            test_path = "abfss://container1@account1.dfs.core.windows.net/folder/file.txt"
-            container, account, key = connector._parse_adls_path(test_path)
+        test_path = "abfss://container1@account1.dfs.core.windows.net/folder/file.txt"
+        container, account, key = connector._parse_adls_path(test_path)
 
-            self.assertEqual(container, "container1")
-            self.assertEqual(account, "account1")
-            self.assertEqual(key, "folder/file.txt")
+        self.assertEqual(container, "container1")
+        self.assertEqual(account, "account1")
+        self.assertEqual(key, "folder/file.txt")
 
-    def test_parse_adls_path_invalid(self):
+    @patch('adls_connector.ADLSConnector._authenticate')
+    def test_parse_adls_path_invalid(self, mock_auth):
         """Verify that _parse_adls_path raises a ValueError when dealing with malformed paths."""
-        with patch.object(ADLSConnector, '_authenticate', return_value=MagicMock()):
-            connector = ADLSConnector(self.mock_spark, self.file_path)
+        mock_auth.return_value = MagicMock()
+        connector = ADLSConnector(self.mock_spark, self.file_path)
 
-            invalid_path = "https://invalid-scheme.com/file"
-            with self.assertRaises(ValueError):
-                connector._parse_adls_path(invalid_path)
+        invalid_path = "https://invalid-scheme.com/file"
+        with self.assertRaises(ValueError):
+            connector._parse_adls_path(invalid_path)
 
     def test_load_script(self):
         """Verify that load_script downloads and successfully decodes remote script content."""
