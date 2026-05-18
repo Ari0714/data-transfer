@@ -1,0 +1,403 @@
+import unittest
+from unittest.mock import Mock, patch, MagicMock, PropertyMock
+from pyspark.sql import SparkSession
+from azure.core.exceptions import AzureError
+from azure.storage.filedatalake import DataLakeServiceClient
+import sys
+import os
+import json
+from urllib.parse import urlparse
+
+# Mock the base_connector module for testing
+sys.modules['etl framework.connectors.base_connector'] = Mock()
+from your_module import ADLSConnector  # Replace with actual module name
+
+
+class TestADLSConnector(unittest.TestCase):
+    """Unit tests for ADLSConnector class"""
+
+    def setUp(self):
+        """Set up test fixtures before each test method"""
+        # Mock SparkSession
+        self.mock_spark = Mock(spec=SparkSession)
+
+        # Set environment variables for testing
+        self.env_patcher = patch.dict('os.environ', {
+            'CATALOG_URL': 'http://test-catalog:8181',
+            'ACCOUNT': 'testaccount',
+            'CONTAINER': 'testcontainer',
+            'REST_TOKEN': 'test-token-123',
+            'DIR': 'test_base_path'
+        })
+        self.env_patcher.start()
+
+        # Test file path
+        self.test_file_path = "abfas://testcontainer@testaccount.dfs.core.windows.net/test/path/file.parquet"
+
+        # Create connector instance
+        self.connector = ADLSConnector(self.mock_spark, self.test_file_path)
+
+    def tearDown(self):
+        """Clean up after each test method"""
+        self.env_patcher.stop()
+        ADLSConnector.instance = None
+
+    # ========== Tests for __new__ and __init__ ==========
+
+    def test_singleton_pattern(self):
+        """Test that ADLSConnector follows singleton pattern"""
+        connector2 = ADLSConnector(self.mock_spark, self.test_file_path)
+        self.assertIs(self.connector, connector2)
+
+    def test_init_skips_if_already_initialized(self):
+        """Test that __init__ skips initialization if already done"""
+        # Set adls_client to a mock value
+        self.connector.adls_client = Mock()
+        mock_fs = Mock()
+        self.connector.fs = mock_fs
+
+        # Re-initialize
+        self.connector.__init__(self.mock_spark, self.test_file_path)
+
+        # fs should remain unchanged
+        self.assertEqual(self.connector.fs, mock_fs)
+
+    # ========== Tests for post_json ==========
+
+    @patch('urllib.request.urlopen')
+    def test_post_json_success_without_token(self, mock_urlopen):
+        """Test post_json successfully posts JSON without token"""
+        # Mock response
+        mock_response = Mock()
+        mock_response.read.return_value = json.dumps({"key": "value"}).encode()
+        mock_urlopen.return_value = mock_response
+
+        url = "http://test.com/api"
+        payload = {"test": "data"}
+        result = self.connector.post_json(url, payload)
+
+        self.assertEqual(result, {"key": "value"})
+        mock_urlopen.assert_called_once()
+
+    @patch('urllib.request.urlopen')
+    def test_post_json_success_with_token(self, mock_urlopen):
+        """Test post_json successfully posts JSON with bearer token"""
+        mock_response = Mock()
+        mock_response.read.return_value = json.dumps({"key": "value"}).encode()
+        mock_urlopen.return_value = mock_response
+
+        url = "http://test.com/api"
+        payload = {"test": "data"}
+        token = "my-bearer-token"
+        result = self.connector.post_json(url, payload, token)
+
+        self.assertEqual(result, {"key": "value"})
+
+        # Verify authorization header was set
+        call_args = mock_urlopen.call_args[0][0]
+        headers = call_args.headers
+        self.assertEqual(headers['Authorization'], f'Bearer {token}')
+
+    # ========== Tests for _find_sas ==========
+
+    def test_find_sas_in_string_with_sas_params(self):
+        """Test find_sas extracts SAS token from string containing sv= and sig="""
+        sas_string = "?sv=2022-11-02&sig=abc123&se=2024-01-01"
+        result = self.connector._find_sas(sas_string)
+        self.assertEqual(result, "sv=2022-11-02&sig=abc123&se=2024-01-01")
+
+    def test_find_sas_in_string_without_question_mark(self):
+        """Test find_sas handles SAS string without leading question mark"""
+        sas_string = "sv=2022-11-02&sig=abc123&se=2024-01-01"
+        result = self.connector._find_sas(sas_string)
+        self.assertEqual(result, "sv=2022-11-02&sig=abc123&se=2024-01-01")
+
+    def test_find_sas_in_string_no_sas_params(self):
+        """Test find_sas returns None when no SAS params found"""
+        sas_string = "regular string without sas"
+        result = self.connector._find_sas(sas_string)
+        self.assertIsNone(result)
+
+    def test_find_sas_in_dict(self):
+        """Test find_sas recursively searches dictionary for SAS token"""
+        test_dict = {
+            "key1": "value1",
+            "key2": {
+                "nested": "?sv=2022&sig=xyz789"
+            }
+        }
+        result = self.connector._find_sas(test_dict)
+        self.assertEqual(result, "sv=2022&sig=xyz789")
+
+    def test_find_sas_in_list(self):
+        """Test find_sas recursively searches list for SAS token"""
+        test_list = [
+            "normal string",
+            {"nested": "?sv=2023&sig=abc456"}
+        ]
+        result = self.connector._find_sas(test_list)
+        self.assertEqual(result, "sv=2023&sig=abc456")
+
+    def test_find_sas_no_match(self):
+        """Test find_sas returns None when no SAS token found in complex structure"""
+        test_data = {
+            "key1": "value1",
+            "key2": [1, 2, 3],
+            "key3": {"nested": "no sas here"}
+        }
+        result = self.connector._find_sas(test_data)
+        self.assertIsNone(result)
+
+    # ========== Tests for _parse_adls_path ==========
+
+    def test_parse_valid_abfs_path(self):
+        """Test _parse_adls_path correctly parses valid abfs:// path"""
+        path = "abfs://mycontainer@myaccount.dfs.core.windows.net/folder/subfolder/file.txt"
+        container, account, key = self.connector._parse_adls_path(path)
+
+        self.assertEqual(container, "mycontainer")
+        self.assertEqual(account, "myaccount")
+        self.assertEqual(key, ["folder", "subfolder", "file.txt"])
+
+    def test_parse_valid_abfas_path(self):
+        """Test _parse_adls_path correctly parses valid abfas:// path"""
+        path = "abfas://mycontainer@myaccount.dfs.core.windows.net/folder/file.csv"
+        container, account, key = self.connector._parse_adls_path(path)
+
+        self.assertEqual(container, "mycontainer")
+        self.assertEqual(account, "myaccount")
+        self.assertEqual(key, ["folder", "file.csv"])
+
+    def test_parse_path_without_scheme(self):
+        """Test _parse_adls_path raises error for invalid scheme"""
+        path = "http://mycontainer@myaccount.dfs.core.windows.net/folder/file.txt"
+        with self.assertRaises(ValueError) as context:
+            self.connector._parse_adls_path(path)
+        self.assertIn("Invalid ADLS path scheme", str(context.exception))
+
+    def test_parse_path_missing_netloc(self):
+        """Test _parse_adls_path raises error when netloc is missing"""
+        path = "abfs:///folder/file.txt"
+        with self.assertRaises(ValueError) as context:
+            self.connector._parse_adls_path(path)
+        self.assertIn("Expected format", str(context.exception))
+
+    def test_parse_path_invalid_split(self):
+        """Test _parse_adls_path raises error when container/account split fails"""
+        path = "abfs://invalidformat/path/file.txt"
+        with self.assertRaises(ValueError) as context:
+            self.connector._parse_adls_path(path)
+        self.assertIn("Path split failed", str(context.exception))
+
+    def test_parse_path_allows_empty_path(self):
+        """Test _parse_adls_path allows empty path when allow_empty_path=True"""
+        path = "abfs://mycontainer@myaccount.dfs.core.windows.net/"
+        container, account, key = self.connector._parse_adls_path(path, allow_empty_path=True)
+        self.assertEqual(container, "mycontainer")
+        self.assertEqual(account, "myaccount")
+        self.assertEqual(key, [])
+
+    # ========== Tests for load_script ==========
+
+    @patch('azure.storage.filedatalake.FileSystemClient')
+    def test_load_script_success(self, mock_fs_client):
+        """Test load_script successfully loads and decodes file content"""
+        # Mock file client
+        mock_file_client = Mock()
+        mock_download = Mock()
+        mock_download.readall.return_value = b"test file content"
+        mock_file_client.download_file.return_value = mock_download
+
+        # Set up connector's fs
+        self.connector.fs = Mock()
+        self.connector.fs.get_file_client.return_value = mock_file_client
+
+        # Test loading
+        content = self.connector.load_script(self.test_file_path)
+        self.assertEqual(content, "test file content")
+        self.connector.fs.get_file_client.assert_called()
+
+    @patch('azure.storage.filedatalake.FileSystemClient')
+    def test_load_script_azure_error(self, mock_fs_client):
+        """Test load_script raises AzureError when Azure operation fails"""
+        self.connector.fs = Mock()
+        self.connector.fs.get_file_client.side_effect = AzureError("Azure connection failed")
+
+        with self.assertRaises(AzureError) as context:
+            self.connector.load_script(self.test_file_path)
+        self.assertIn("Error when reading ADLS file", str(context.exception))
+
+    def test_load_script_invalid_path(self):
+        """Test load_script raises ValueError for invalid path format"""
+        invalid_path = "invalid://path/file.txt"
+        with self.assertRaises(ValueError) as context:
+            self.connector.load_script(invalid_path)
+        self.assertIn("Invalid ADLS path scheme", str(context.exception))
+
+    # ========== Tests for list_files ==========
+
+    @patch('azure.storage.filedatalake.FileSystemClient')
+    def test_list_files_success(self, mock_fs_client):
+        """Test list_files successfully returns list of file paths"""
+        mock_paths = [
+            Mock(name="folder/file1.parquet"),
+            Mock(name="folder/file2.parquet"),
+            Mock(name="folder/subfolder/file3.parquet")
+        ]
+
+        self.connector.fs = Mock()
+        self.connector.fs.get_paths.return_value = mock_paths
+
+        path = "abfs://mycontainer@myaccount.dfs.core.windows.net/folder"
+        result = self.connector.list_files(path, recursive=True)
+
+        expected = ["folder/file1.parquet", "folder/file2.parquet", "folder/subfolder/file3.parquet"]
+        self.assertEqual(result, expected)
+        self.connector.fs.get_paths.assert_called_with(path='folder', recursive=True)
+
+    def test_list_files_azure_error(self):
+        """Test list_files raises AzureError when listing fails"""
+        self.connector.fs = Mock()
+        self.connector.fs.get_paths.side_effect = AzureError("Failed to list paths")
+
+        path = "abfs://mycontainer@myaccount.dfs.core.windows.net/folder"
+        with self.assertRaises(AzureError) as context:
+            self.connector.list_files(path)
+        self.assertIn("Error when listing ADLS path", str(context.exception))
+
+    # ========== Tests for download_file ==========
+
+    @patch('builtins.open', unittest.mock.mock_open())
+    @patch('azure.storage.filedatalake.FileSystemClient')
+    def test_download_file_success(self, mock_fs_client):
+        """Test download_file successfully downloads and writes file"""
+        mock_file_client = Mock()
+        mock_download = Mock()
+        mock_download.readall.return_value = b"binary file content"
+        mock_file_client.download_file.return_value = mock_download
+
+        self.connector.fs = Mock()
+        self.connector.fs.get_file_client.return_value = mock_file_client
+
+        local_path = "/tmp/local_file.txt"
+        result = self.connector.download_file(self.test_file_path, local_path)
+
+        self.assertEqual(result, local_path)
+        mock_file_client.download_file.assert_called_once()
+
+    def test_download_file_azure_error(self):
+        """Test download_file raises AzureError when download fails"""
+        self.connector.fs = Mock()
+        self.connector.fs.get_file_client.side_effect = AzureError("Download failed")
+
+        local_path = "/tmp/local_file.txt"
+        with self.assertRaises(AzureError) as context:
+            self.connector.download_file(self.test_file_path, local_path)
+        self.assertIn("Error when downloading ADLS file", str(context.exception))
+
+    # ========== Tests for delete_path ==========
+
+    @patch('azure.storage.filedatalake.FileSystemClient')
+    def test_delete_path_success(self, mock_fs_client):
+        """Test delete_path successfully deletes directory"""
+        self.connector.fs = Mock()
+        self.connector.fs.delete_directory = Mock()
+
+        result = self.connector.delete_path(self.test_file_path)
+        self.assertIsNone(result)
+        self.connector.fs.delete_directory.assert_called_once()
+
+    def test_delete_path_azure_error(self):
+        """Test delete_path raises AzureError when deletion fails"""
+        self.connector.fs = Mock()
+        self.connector.fs.delete_directory.side_effect = AzureError("Deletion failed")
+
+        with self.assertRaises(AzureError) as context:
+            self.connector.delete_path(self.test_file_path)
+        self.assertIn("Error when deleting ADLS path", str(context.exception))
+
+    # ========== Tests for upload_file ==========
+
+    @patch('builtins.open', unittest.mock.mock_open(read_data=b"local file content"))
+    @patch('azure.storage.filedatalake.FileSystemClient')
+    def test_upload_file_success(self, mock_fs_client):
+        """Test upload_file successfully uploads file"""
+        mock_file_client = Mock()
+        mock_file_client.upload_data = Mock()
+
+        self.connector.fs = Mock()
+        self.connector.fs.get_file_client.return_value = mock_file_client
+
+        local_path = "/tmp/local_file.txt"
+        result = self.connector.upload_file(local_path, self.test_file_path, overwrite=True)
+
+        self.assertEqual(result, self.test_file_path)
+        mock_file_client.upload_data.assert_called_once()
+
+    def test_upload_file_azure_error(self):
+        """Test upload_file raises AzureError when upload fails"""
+        self.connector.fs = Mock()
+        self.connector.fs.get_file_client.side_effect = AzureError("Upload failed")
+
+        local_path = "/tmp/local_file.txt"
+        with self.assertRaises(AzureError) as context:
+            self.connector.upload_file(local_path, self.test_file_path)
+        self.assertIn("Error when uploading ADLS file", str(context.exception))
+
+    # ========== Tests for authenticate (mock only) ==========
+
+    @patch('azure.storage.filedatalake.DataLakeServiceClient')
+    @patch('your_module.ADLSConnector.post_json')
+    def test_authenticate_success(self, mock_post_json, mock_datalake_client):
+        """Test authenticate successfully authenticates and returns file system client"""
+        # Mock credential response
+        mock_cred_response = {
+            'credentials': {
+                'afbss://testcontainer': {
+                    'adls.sas-token.testaccount': 'sv=2022&sig=test123',
+                    'adls.sas-token.expires-at-ms.testaccount': '1700000000000'
+                }
+            }
+        }
+        mock_post_json.return_value = mock_cred_response
+
+        # Mock DataLakeServiceClient
+        mock_service_client = Mock()
+        mock_file_system = Mock()
+        mock_service_client.get_file_system_client.return_value = mock_file_system
+        mock_datalake_client.return_value = mock_service_client
+
+        # Set REST_TOKEN
+        self.connector.REST_TOKEN = "test-token"
+
+        # Call authenticate
+        result = self.connector._authenticate()
+
+        self.assertEqual(result, mock_file_system)
+        mock_post_json.assert_called_once()
+
+    @patch('azure.storage.filedatalake.DataLakeServiceClient')
+    @patch('your_module.ADLSConnector.post_json')
+    def test_authenticate_fallback_to_find_sas(self, mock_post_json, mock_datalake_client):
+        """Test authenticate falls back to _find_sas when direct SAS lookup fails"""
+        # Mock credential response without direct SAS entry
+        mock_cred_response = {
+            'credentials': {
+                'some_other_key': '?sv=2022&sig=fallback123'
+            }
+        }
+        mock_post_json.return_value = mock_cred_response
+
+        mock_service_client = Mock()
+        mock_file_system = Mock()
+        mock_service_client.get_file_system_client.return_value = mock_file_system
+        mock_datalake_client.return_value = mock_service_client
+
+        self.connector.REST_TOKEN = "test-token"
+        result = self.connector._authenticate()
+
+        self.assertEqual(result, mock_file_system)
+
+
+if __name__ == '__main__':
+    unittest.main()
