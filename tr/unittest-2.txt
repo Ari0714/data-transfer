@@ -1,0 +1,99 @@
+import unittest
+from unittest.mock import MagicMock, patch
+import os
+
+# Assuming the original code is in a file named 'adls_utils.py'
+from adls_utils import _is_adls_path, download_from_adls
+
+
+class TestADLSUtils(unittest.TestCase):
+
+    # -------------------------------------------------------------------------
+    # Tests for _is_adls_path
+    # -------------------------------------------------------------------------
+
+    def test_is_adls_path_valid(self):
+        """Should return True when the path starts with abfss://"""
+        path = "abfss://mycontainer@mystorage.dfs.core.windows.net/file.csv"
+        self.assertTrue(_is_adls_path(path))
+
+    def test_is_adls_path_invalid(self):
+        """Should return False when the path does not start with abfss://"""
+        path = "s3://mybucket/file.csv"
+        self.assertFalse(_is_adls_path(path))
+
+    # -------------------------------------------------------------------------
+    # Tests for download_from_adls
+    # -------------------------------------------------------------------------
+
+    @patch("adls_utils.ADLSConnector")
+    @patch("adls_utils.os.makedirs")
+    @patch("adls_utils.os.path.dirname")
+    def test_download_from_adls_with_local_path(
+        self, mock_dirname, mock_makedirs, mock_adls_connector
+    ):
+        """
+        Should successfully execute the download pipeline when a custom local_path is provided.
+        It must create the parent directory and initialize the ADLSConnector properly.
+        """
+        # Arrange
+        adls_path = "abfss://container/data.csv"
+        local_path = "/mock/local/dir/data.csv"
+        mock_dirname.return_value = "/mock/local/dir"
+
+        # Mock the instance returned by ADLSConnector
+        mock_conn_instance = MagicMock()
+        mock_adls_connector.return_value = mock_conn_instance
+
+        # Act
+        result = download_from_adls(adls_path, local_path=local_path)
+
+        # Assert
+        mock_dirname.assert_called_once_with(local_path)
+        mock_makedirs.assert_called_once_with("/mock/local/dir", exist_ok=True)
+
+        # Verify ADLSConnector initialization and method call
+        mock_adls_connector.assert_called_once_with(spark=None, file_path=adls_path)
+        mock_conn_instance.download_file.assert_called_once_with(adls_path, local_path)
+
+        self.assertEqual(result, local_path)
+
+    @patch("adls_utils.S3Constants")
+    @patch("adls_utils.ADLSConnector")
+    @patch("adls_utils.os.makedirs")
+    @patch("adls_utils.os.path.join")
+    def test_download_from_adls_without_local_path(
+        self, mock_join, mock_makedirs, mock_adls_connector, mock_s3_constants
+    ):
+        """
+        Should default to the S3Constants.DOWNLOAD_FOLDER and parse the filename from the ADLS path
+         when local_path is not specified.
+        """
+        # Arrange
+        adls_path = "abfss://container/folder/my_target_file.parquet/"
+        mock_s3_constants.DOWNLOAD_FOLDER = "/default/s3/download/path"
+
+        # Simulated joined path
+        expected_download_path = "/default/s3/download/path/my_target_file.parquet"
+        mock_join.return_value = expected_download_path
+
+        mock_conn_instance = MagicMock()
+        mock_adls_connector.return_value = mock_conn_instance
+
+        # Act
+        result = download_from_adls(adls_path, local_path=None)
+
+        # Assert
+        # The code rstrips '/' and splits by '/'.
+        # "abfss://container/folder/my_target_file.parquet/" becomes "my_target_file.parquet"
+        mock_makedirs.assert_called_once_with("/default/s3/download/path", exist_ok=True)
+        mock_join.assert_called_once_with("/default/s3/download/path", "my_target_file.parquet")
+
+        mock_adls_connector.assert_called_once_with(spark=None, file_path=adls_path)
+        mock_conn_instance.download_file.assert_called_once_with(adls_path, expected_download_path)
+
+        self.assertEqual(result, expected_download_path)
+
+
+if __name__ == "__main__":
+    unittest.main()
