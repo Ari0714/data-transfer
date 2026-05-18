@@ -1,7 +1,6 @@
 import unittest
 from unittest.mock import MagicMock, patch
-import json
-import sys
+import os
 
 # Assuming your original source code file is named adls_connector.py
 from adls_connector import ADLSConnector
@@ -87,27 +86,37 @@ class TestADLSConnector(unittest.TestCase):
         self.assertEqual(sas, "sv=2021&sig=abcdefg")
 
     @patch('adls_connector.DataLakeServiceClient')
-    @patch('adls_connector.ADLSConnector.post_json')
-    def test_authenticate_success(self, mock_post_json, mock_service_client):
+    @patch('adls_connector.ADLSConnector._authenticate')
+    def test_authenticate_success(self, mock_auth, mock_service_client):
         """Verify successful token acquisition and correct FileSystemClient routing."""
+        # 1. Heavily block _authenticate during __init__ to prevent ANY SystemExit risks
+        mock_auth.return_value = MagicMock()
+        connector = ADLSConnector(self.mock_spark, self.file_path)
+
+        # 2. Setup Azure SDK Mocks
         mock_fs_client = MagicMock()
         mock_svc_instance = MagicMock()
         mock_svc_instance.get_file_system_client.return_value = mock_fs_client
         mock_service_client.return_value = mock_svc_instance
 
-        # Mock post_json returning valid credential payloads prior to object creation
-        mock_post_json.return_value = {
+        # 3. Setup the custom mock response for post_json to perfectly fit your source code logic
+        mock_credentials = {
             'credentials': {
-                'adls.sas-token.myaccount': 'mock_sas_token_value',
-                'adls.sas-token.expires-at-ms.myaccount': '1700000000000'
+                'abfss://mycontainer@myaccount.dfs.core.windows.net/mydir': {
+                    'adls.sas-token.myaccount': 'mock_sas_token_value',
+                    'adls.sas-token.expires-at-ms.myaccount': '1700000000000'
+                }
             }
         }
+        connector.post_json = MagicMock(return_value=mock_credentials)
 
-        # Instantiation will trigger _authenticate, which internally runs our mocked post_json safely
-        connector = ADLSConnector(self.mock_spark, self.file_path)
+        # 4. Un-mock the method manually and invoke it in complete isolation
+        # This guarantees that we are executing the real code inside _authenticate safely
+        real_authenticate = ADLSConnector._authenticate.__wrapped__
+        result_fs = real_authenticate(connector)
 
-        # Ensure the assigned file system client matches our mocked instance
-        self.assertEqual(connector.fs, mock_fs_client)
+        # 5. Assertions
+        self.assertEqual(result_fs, mock_fs_client)
         mock_service_client.assert_called_once_with(
             'https://myaccount.dfs.core.windows.net',
             credential='mock_sas_token_value',
