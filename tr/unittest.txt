@@ -86,40 +86,39 @@ class TestADLSConnector(unittest.TestCase):
         self.assertEqual(sas, "sv=2021&sig=abcdefg")
 
     @patch('adls_connector.DataLakeServiceClient')
-    @patch('adls_connector.ADLSConnector._authenticate')
-    def test_authenticate_success(self, mock_auth, mock_service_client):
+    @patch('adls_connector.ADLSConnector.post_json')
+    def test_authenticate_success(self, mock_post_json, mock_service_client):
         """Verify successful token acquisition and correct FileSystemClient routing."""
-        # 1. Heavily block _authenticate during __init__ to prevent ANY SystemExit risks
-        mock_auth.return_value = MagicMock()
-        connector = ADLSConnector(self.mock_spark, self.file_path)
-
-        # 2. Setup Azure SDK Mocks
+        # Setup Azure SDK Client mocks
         mock_fs_client = MagicMock()
         mock_svc_instance = MagicMock()
         mock_svc_instance.get_file_system_client.return_value = mock_fs_client
         mock_service_client.return_value = mock_svc_instance
 
-        # 3. Setup the custom mock response for post_json to perfectly fit your source code logic
-        mock_credentials = {
+        # Match exactly what self.PATH expands to based on our env patcher settings
+        expected_path_key = "abfss://mycontainer@myaccount.dfs.core.windows.net/mydir"
+
+        # Setup the credential dictionary mapping structure to fulfill lines 77-83 perfectly
+        mock_post_json.return_value = {
             'credentials': {
-                'abfss://mycontainer@myaccount.dfs.core.windows.net/mydir': {
-                    'adls.sas-token.myaccount': 'mock_sas_token_value',
+                expected_path_key: {
+                    'adls.sas-token.myaccount': 'sv=2021-08-06&sig=mock_sas_token_value',
                     'adls.sas-token.expires-at-ms.myaccount': '1700000000000'
                 }
             }
         }
-        connector.post_json = MagicMock(return_value=mock_credentials)
 
-        # 4. Un-mock the method manually and invoke it in complete isolation
-        # This guarantees that we are executing the real code inside _authenticate safely
-        real_authenticate = ADLSConnector._authenticate.__wrapped__
-        result_fs = real_authenticate(connector)
+        # Instantiation here automatically invokes the true, unpatched _authenticate() logic
+        # using our targeted mock values safely without throwing any SystemExit exceptions
+        connector = ADLSConnector(self.mock_spark, self.file_path)
 
-        # 5. Assertions
-        self.assertEqual(result_fs, mock_fs_client)
+        # Verify the file system client matches the mock
+        self.assertEqual(connector.fs, mock_fs_client)
+
+        # Verify Azure Service Client was loaded with correct endpoint strings
         mock_service_client.assert_called_once_with(
             'https://myaccount.dfs.core.windows.net',
-            credential='mock_sas_token_value',
+            credential='sv=2021-08-06&sig=mock_sas_token_value',
             connection_verify=False
         )
 
